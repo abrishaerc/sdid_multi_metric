@@ -321,6 +321,27 @@ def build_time_weight_arrays(Y: np.ndarray, treated: np.ndarray, cfg: SimConfig)
 # Treatment effect estimator
 # ---------------------------------------------------------------------------
 
+def compute_gap_series(
+    Y: np.ndarray,
+    treated: np.ndarray,
+    w: np.ndarray,
+) -> np.ndarray:
+    """
+    Compute the per-period gap between treated group mean and synthetic control.
+
+    Args:
+        Y       : (K, T, N) outcome array
+        treated : (N,) binary treatment assignment
+        w       : (J,) donor unit weights
+
+    Returns gap : (K, T) array — treated_mean_t - synth_t for each metric and period.
+    """
+    donor_mask = (treated == 0)
+    y_treat    = Y[:, :, treated == 1].mean(axis=2)   # (K, T)
+    synth      = Y[:, :, donor_mask] @ w               # (K, T)
+    return y_treat - synth
+
+
 def compute_sdid_estimate(
     Y: np.ndarray,
     treated: np.ndarray,
@@ -346,20 +367,8 @@ def compute_sdid_estimate(
     if lambda_t is None:
         lambda_t = np.ones(cfg.n_pre) / cfg.n_pre
 
-    donor_mask  = (treated == 0)
-    treat_mask  = (treated == 1)
-    n_treat     = treat_mask.sum()
-
-    # Treated group mean: (K, T)
-    y_treat = Y[:, :, treat_mask].mean(axis=2)
-
-    # Synthetic control: (K, T)  =  Y_donors @ w  →  (K, T, J) @ (J,) = (K, T)
-    synth = Y[:, :, donor_mask] @ w
-
-    # Gap: (K, T)
-    gap = y_treat - synth
-
-    post_gap = gap[:, cfg.n_pre:].mean(axis=1)              # (K,)
+    gap = compute_gap_series(Y, treated, w)              # (K, T)
+    post_gap = gap[:, cfg.n_pre:].mean(axis=1)           # (K,)
     pre_gap  = (gap[:, :cfg.n_pre] * lambda_t).sum(axis=1)  # (K,)
 
     return post_gap - pre_gap
@@ -464,15 +473,26 @@ def run_monte_carlo(cfg: SimConfig) -> pd.DataFrame:
             # RMSPE per metric on demeaned pre-treatment data
             rmspe = np.sqrt(np.mean((y_treat_dm - Y_don_dm @ w) ** 2, axis=1))  # (K,)
 
+            # Per-period gap series for event study (baseline = last pre-period)
+            gap = compute_gap_series(Y, treated, w)   # (K, T)
+            baseline = gap[:, cfg.n_pre - 1]          # (K,) — period right before treatment
+            gap_norm = gap - baseline[:, None]         # (K, T) normalized to 0 at t=-1
+
             for k, metric in enumerate(metric_names):
-                records.append({
+                row = {
                     "sim":         sim,
                     "approach":    approach,
                     "metric":      metric,
                     "tau_hat":     float(observed[k]),
                     "significant": int(pvals[k] < cfg.alpha),
                     "rmspe":       float(rmspe[k]),
-                })
+                }
+                # Store gap at each period (relative period index: -n_pre … n_post-1)
+                T = cfg.n_pre + cfg.n_post
+                for t in range(T):
+                    rel_t = t - cfg.n_pre          # -8 … +3 for n_pre=8, n_post=4
+                    row[f"gap_t{rel_t}"] = float(gap_norm[k, t])
+                records.append(row)
 
         if (sim + 1) % 50 == 0:
             print(f"  Completed {sim + 1}/{cfg.n_simulations} simulations")
@@ -631,8 +651,152 @@ def plot_results(results: pd.DataFrame, cfg: SimConfig):
                     f"{val:.3f}", ha="center", va="bottom", fontsize=7)
 
     plt.savefig("/Users/aasfaw/claude/sdid_multimetric_results.png", dpi=150, bbox_inches="tight")
-    plt.show()
+    plt.close()
     print("Plot saved to sdid_multimetric_results.png")
+
+    # --- Separate table figure: bias, MSE, SE, FPR, RMSPE ---
+    stat_summary = (
+        results
+        .groupby(["approach_label", "metric"])
+        .agg(
+            bias       =("tau_hat",     "mean"),
+            mse        =("tau_hat",     lambda x: (x**2).mean()),
+            emp_se     =("tau_hat",     "std"),
+            fpr        =("significant", "mean"),
+            mean_rmspe =("rmspe",       "mean"),
+        )
+        .round(4)
+        .reset_index()
+    )
+    stat_summary["approach_label"] = pd.Categorical(
+        stat_summary["approach_label"], categories=approach_order, ordered=True
+    )
+    stat_summary = stat_summary.sort_values(["metric", "approach_label"])
+
+    fig2, axes2 = plt.subplots(1, 2, figsize=(16, 5))
+    fig2.suptitle(
+        f"A/A Simulation — Summary Statistics\n"
+        f"{cfg.n_simulations} sims | {cfg.n_units} units | "
+        f"{cfg.n_pre} pre + {cfg.n_post} post periods | True τ = 0",
+        fontsize=12, fontweight="bold"
+    )
+
+    stat_cols  = ["bias", "mse", "emp_se", "fpr", "mean_rmspe"]
+    col_labels = ["Bias", "MSE", "Emp SE", "FPR", "RMSPE"]
+
+    for col, metric in enumerate(["atc", "orders"]):
+        ax = axes2[col]
+        ax.axis("off")
+        sub = stat_summary[stat_summary["metric"] == metric][
+            ["approach_label"] + stat_cols
+        ].reset_index(drop=True)
+
+        cell_text  = sub[stat_cols].values.tolist()
+        row_labels = sub["approach_label"].tolist()
+
+        # Color FPR cells: green if within 0.02 of alpha, red if outside
+        cell_colors = []
+        for row in sub.itertuples():
+            fpr_ok = abs(row.fpr - cfg.alpha) <= 0.02
+            cell_colors.append(
+                ["#f5f5f5", "#f5f5f5", "#f5f5f5",
+                 "#c8e6c9" if fpr_ok else "#ffcdd2",
+                 "#f5f5f5"]
+            )
+
+        tbl = ax.table(
+            cellText=[[f"{v:.4f}" for v in row] for row in cell_text],
+            rowLabels=row_labels,
+            colLabels=col_labels,
+            cellColours=cell_colors,
+            rowColours=[colors[r] + "55" for r in row_labels],
+            loc="center",
+            cellLoc="center",
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(10)
+        tbl.scale(1.3, 2.0)
+        ax.set_title(f"{metric.upper()}", fontsize=11, fontweight="bold", pad=12)
+
+    fig2.text(0.5, 0.01,
+              "FPR cell: green = within 0.02 of α=0.05 (well-calibrated), red = outside",
+              ha="center", fontsize=9, style="italic")
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    plt.savefig("/Users/aasfaw/claude/sdid_multimetric_table.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print("Table plot saved to sdid_multimetric_table.png")
+
+
+# ---------------------------------------------------------------------------
+# Event study plots
+# ---------------------------------------------------------------------------
+
+def plot_event_study(results: pd.DataFrame, cfg: SimConfig):
+    """
+    One event study panel per metric per weighting approach (10 panels total).
+    Each panel shows:
+      - Mean gap across simulations per period (solid line)
+      - 95% pointwise CI band (shaded)
+      - Vertical dashed line at treatment onset
+      - Horizontal dashed line at zero
+      - Baseline period (t = -1, last pre-period) is normalized to 0 by construction
+    """
+    import matplotlib.pyplot as plt
+
+    approach_order = ["single_atc", "single_orders", "joint", "average", "joint_time"]
+    colors = {
+        "single_atc":    "#E57373",
+        "single_orders": "#FF8A65",
+        "joint":         "#4CAF50",
+        "average":       "#64B5F6",
+        "joint_time":    "#9575CD",
+    }
+
+    T      = cfg.n_pre + cfg.n_post
+    rel_ts = [t - cfg.n_pre for t in range(T)]           # e.g. -8…+3
+    gap_cols = [f"gap_t{t}" for t in rel_ts]
+
+    for metric in ["atc", "orders"]:
+        fig, axes = plt.subplots(1, 5, figsize=(22, 4), sharey=True)
+        fig.suptitle(
+            f"Event Study — {metric.upper()} | Baseline = t=−1 (last pre-period) | "
+            f"True τ = 0 | {cfg.n_simulations} sims",
+            fontsize=11, fontweight="bold"
+        )
+
+        sub = results[results["metric"] == metric]
+
+        for col, approach in enumerate(approach_order):
+            ax = axes[col]
+            ap_sub = sub[sub["approach"] == approach][gap_cols]
+
+            mean_gap = ap_sub.mean(axis=0).values         # (T,)
+            se_gap   = ap_sub.std(axis=0).values          # (T,)
+            ci_lo    = mean_gap - 1.96 * se_gap
+            ci_hi    = mean_gap + 1.96 * se_gap
+
+            color = colors[approach]
+
+            ax.fill_between(rel_ts, ci_lo, ci_hi, alpha=0.20, color=color)
+            ax.plot(rel_ts, mean_gap, color=color, linewidth=2, marker="o", markersize=4)
+
+            ax.axvline(-0.5, color="black", linewidth=1.2, linestyle="--", label="Treatment")
+            ax.axhline(0,    color="gray",  linewidth=0.8, linestyle=":")
+
+            ax.set_title(APPROACH_LABELS[approach], fontsize=9, fontweight="bold")
+            ax.set_xlabel("Period relative to treatment")
+            if col == 0:
+                ax.set_ylabel("Gap (treated − synthetic control)\nnormalized to 0 at t=−1")
+            ax.set_xticks(rel_ts)
+            ax.set_xticklabels([str(t) for t in rel_ts], fontsize=7, rotation=45)
+            ax.grid(True, alpha=0.25)
+
+        plt.tight_layout()
+        fname = f"/Users/aasfaw/claude/sdid_event_study_{metric}.png"
+        plt.savefig(fname, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"Event study saved to sdid_event_study_{metric}.png")
 
 
 # ---------------------------------------------------------------------------
@@ -656,7 +820,13 @@ def main():
     results  = run_monte_carlo(cfg)
     summary  = summarize_results(results)
     print_summary(summary, cfg)
+
+    csv_path = "/Users/aasfaw/claude/sdid_multimetric_summary.csv"
+    summary.reset_index().to_csv(csv_path, index=False)
+    print(f"Summary saved to sdid_multimetric_summary.csv")
+
     plot_results(results, cfg)
+    plot_event_study(results, cfg)
 
 
 # ---------------------------------------------------------------------------
