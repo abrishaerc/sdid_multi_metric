@@ -126,18 +126,24 @@ def demean_array(Y: np.ndarray, cfg: SimConfig) -> np.ndarray:
 def solve_unit_weights(
     y_treated: np.ndarray,
     Y_donors: np.ndarray,
+    regularize: bool = False,
 ) -> np.ndarray:
     """
     Solve for donor unit weights w via constrained least squares (SLSQP).
 
-    Minimizes the sum of squared pre-treatment fit residuals:
+    Unregularized objective:
         min_w  sum_{k,t} ( y_treated[k,t] - w @ Y_donors[k,t,:] )^2
 
-    where:
-        y_treated : (K, T_pre) array — treated group mean per (outcome, period)
-        Y_donors  : (K, T_pre, J) array — donor outcomes per (outcome, period, unit)
+    Regularized objective (ridge, same convention as SDiD time weights):
+        min_w  sum_{k,t} ( y_treated[k,t] - w @ Y_donors[k,t,:] )^2
+               + zeta_w^2 * J * ||w||^2
+    where zeta_w = mean(|Y_donors_pre|)^(1/4)  — 4th root of mean donor level.
+    This pushes weights toward uniform (1/J) when T_pre is small relative to J.
 
-    For single-metric: K=1.  For joint multi-metric: K=2 (ATC stacked over Orders).
+    Args:
+        y_treated  : (K, T_pre) — treated group mean per outcome per pre-period
+        Y_donors   : (K, T_pre, J) — donor outcomes
+        regularize : if True, add L2 ridge penalty
 
     Constraints: w_j >= 0,  sum(w) = 1.
 
@@ -145,19 +151,25 @@ def solve_unit_weights(
     """
     K, T_pre, J = Y_donors.shape
 
-    # Flatten (K, T_pre) into one long vector for both y_treated and each donor
-    y_flat = y_treated.reshape(-1)           # (K*T_pre,)
-    X_flat = Y_donors.reshape(-1, J)        # (K*T_pre, J)
+    y_flat = y_treated.reshape(-1)    # (K*T_pre,)
+    X_flat = Y_donors.reshape(-1, J)  # (K*T_pre, J)
+
+    # Regularization strength: 4th root of mean absolute donor pre-treatment level
+    if regularize:
+        zeta_w = float(np.mean(np.abs(Y_donors))) ** 0.25
+        reg    = (zeta_w ** 2) * J
+    else:
+        reg = 0.0
 
     def objective(w):
         residuals = y_flat - X_flat @ w
-        return np.dot(residuals, residuals)
+        return np.dot(residuals, residuals) + reg * np.dot(w, w)
 
     def gradient(w):
         residuals = y_flat - X_flat @ w
-        return -2 * X_flat.T @ residuals
+        return -2 * X_flat.T @ residuals + 2 * reg * w
 
-    w0 = np.ones(J) / J  # uniform initialisation
+    w0 = np.ones(J) / J
 
     constraints = {"type": "eq", "fun": lambda w: np.sum(w) - 1}
     bounds = [(0, None)] * J
@@ -196,39 +208,43 @@ def build_weight_inputs(Y: np.ndarray, treated: np.ndarray, cfg: SimConfig):
 
 def compute_all_unit_weights(Y: np.ndarray, treated: np.ndarray, cfg: SimConfig) -> dict:
     """
-    Compute all five sets of donor unit weights for one simulation.
+    Compute all nine sets of donor unit weights for one simulation.
 
-    Args:
-        Y       : (K, T, N) outcome array (original, not demeaned)
-        treated : (N,) binary treatment assignment
+    Unregularized (5): single_atc, single_orders, joint, average, joint_time
+    Regularized   (4): single_atc_reg, single_orders_reg, joint_reg, joint_reg_time
 
-    Returns a dict with keys:
-        'single_atc'    : w from ATC pre-treatment fit only
-        'single_orders' : w from Orders pre-treatment fit only
-        'joint'         : w from stacked ATC + Orders joint fit
-        'average'       : simple average of single_atc and single_orders
-        'joint_time'    : same as 'joint' (time weights added later)
+    'joint_time' and 'joint_reg_time' carry the same unit weights as their
+    non-time counterparts; SDiD time weights are added separately in the MC loop.
     """
     Y_dm = demean_array(Y, cfg)
     y_treat, Y_don = build_weight_inputs(Y_dm, treated, cfg)
 
-    # Single-metric: K=1 slice
-    y_atc    = y_treat[[0], :]       # (1, T_pre)
-    y_orders = y_treat[[1], :]       # (1, T_pre)
-    Y_atc    = Y_don[[0], :, :]      # (1, T_pre, J)
-    Y_orders = Y_don[[1], :, :]      # (1, T_pre, J)
+    y_atc    = y_treat[[0], :]
+    y_orders = y_treat[[1], :]
+    Y_atc    = Y_don[[0], :, :]
+    Y_orders = Y_don[[1], :, :]
 
-    w_atc    = solve_unit_weights(y_atc,    Y_atc)
-    w_orders = solve_unit_weights(y_orders, Y_orders)
-    w_joint  = solve_unit_weights(y_treat,  Y_don)   # joint: all K stacked
+    # Unregularized
+    w_atc    = solve_unit_weights(y_atc,    Y_atc,    regularize=False)
+    w_orders = solve_unit_weights(y_orders, Y_orders, regularize=False)
+    w_joint  = solve_unit_weights(y_treat,  Y_don,    regularize=False)
     w_avg    = (w_atc + w_orders) / 2
 
+    # Regularized
+    w_atc_r    = solve_unit_weights(y_atc,    Y_atc,    regularize=True)
+    w_orders_r = solve_unit_weights(y_orders, Y_orders, regularize=True)
+    w_joint_r  = solve_unit_weights(y_treat,  Y_don,    regularize=True)
+
     return {
-        "single_atc":    w_atc,
-        "single_orders": w_orders,
-        "joint":         w_joint,
-        "average":       w_avg,
-        "joint_time":    w_joint.copy(),
+        "single_atc":        w_atc,
+        "single_orders":     w_orders,
+        "joint":             w_joint,
+        "average":           w_avg,
+        "joint_time":        w_joint.copy(),
+        "single_atc_reg":    w_atc_r,
+        "single_orders_reg": w_orders_r,
+        "joint_reg":         w_joint_r,
+        "joint_reg_time":    w_joint_r.copy(),
     }
 
 
@@ -443,7 +459,11 @@ def run_monte_carlo(cfg: SimConfig) -> pd.DataFrame:
     rng = np.random.default_rng(cfg.seed)
     records = []
 
-    approach_keys = ["single_atc", "single_orders", "joint", "average", "joint_time"]
+    approach_keys = [
+        "single_atc", "single_orders", "joint", "average", "joint_time",
+        "single_atc_reg", "single_orders_reg", "joint_reg", "joint_reg_time",
+    ]
+    time_weight_approaches = {"joint_time", "joint_reg_time"}
     metric_names  = ["atc", "orders"]
 
     for sim in range(cfg.n_simulations):
@@ -463,20 +483,21 @@ def run_monte_carlo(cfg: SimConfig) -> pd.DataFrame:
 
         for approach in approach_keys:
             w   = weights[approach]
-            lam = lambda_t if approach == "joint_time" else None
+            lam = lambda_t if approach in time_weight_approaches else None
 
             observed = compute_sdid_estimate(Y, treated, w, cfg, lambda_t=lam)
-            pvals    = permutation_pvalue(Y, treated, w, cfg, lam if lam is not None
+            pvals    = permutation_pvalue(Y, treated, w, cfg,
+                                          lam if lam is not None
                                           else np.ones(cfg.n_pre) / cfg.n_pre,
                                           observed, rng)
 
             # RMSPE per metric on demeaned pre-treatment data
             rmspe = np.sqrt(np.mean((y_treat_dm - Y_don_dm @ w) ** 2, axis=1))  # (K,)
 
-            # Per-period gap series for event study (baseline = last pre-period)
-            gap = compute_gap_series(Y, treated, w)   # (K, T)
-            baseline = gap[:, cfg.n_pre - 1]          # (K,) — period right before treatment
-            gap_norm = gap - baseline[:, None]         # (K, T) normalized to 0 at t=-1
+            # Per-period gap series for event study (baseline = mean of pre-treatment gaps)
+            gap = compute_gap_series(Y, treated, w)              # (K, T)
+            baseline = gap[:, :cfg.n_pre].mean(axis=1)           # (K,) — avg pre-treatment gap
+            gap_norm = gap - baseline[:, None]                   # (K, T) normalized to pre-mean
 
             for k, metric in enumerate(metric_names):
                 row = {
@@ -505,11 +526,32 @@ def run_monte_carlo(cfg: SimConfig) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 APPROACH_LABELS = {
-    "single_atc":    "Single-ATC",
-    "single_orders": "Single-Orders",
-    "joint":         "Joint",
-    "average":       "Average",
-    "joint_time":    "Joint+Time",
+    "single_atc":        "Single-ATC",
+    "single_orders":     "Single-Orders",
+    "joint":             "Joint",
+    "average":           "Average",
+    "joint_time":        "Joint+Time",
+    "single_atc_reg":    "Single-ATC-Reg",
+    "single_orders_reg": "Single-Orders-Reg",
+    "joint_reg":         "Joint-Reg",
+    "joint_reg_time":    "Joint-Reg+Time",
+}
+
+APPROACH_ORDER = [
+    "Single-ATC", "Single-Orders", "Joint", "Average", "Joint+Time",
+    "Single-ATC-Reg", "Single-Orders-Reg", "Joint-Reg", "Joint-Reg+Time",
+]
+
+APPROACH_COLORS = {
+    "Single-ATC":        "#E57373",
+    "Single-Orders":     "#FF8A65",
+    "Joint":             "#4CAF50",
+    "Average":           "#64B5F6",
+    "Joint+Time":        "#9575CD",
+    "Single-ATC-Reg":    "#B71C1C",
+    "Single-Orders-Reg": "#BF360C",
+    "Joint-Reg":         "#1B5E20",
+    "Joint-Reg+Time":    "#4A148C",
 }
 
 def summarize_results(results: pd.DataFrame) -> pd.DataFrame:
@@ -535,6 +577,9 @@ def summarize_results(results: pd.DataFrame) -> pd.DataFrame:
     summary.index = summary.index.set_levels(
         [APPROACH_LABELS.get(a, a) for a in summary.index.levels[0]], level=0
     )
+    # Reorder rows to match APPROACH_ORDER
+    existing = [a for a in APPROACH_ORDER if a in summary.index.get_level_values(0)]
+    summary = summary.reindex(existing, level=0)
     return summary
 
 
@@ -549,15 +594,14 @@ def print_summary(summary: pd.DataFrame, cfg: SimConfig):
           f"{'Emp SE':>8} {'FPR':>7} {'RMSPE':>8}")
     print("-" * 72)
 
-    approach_order = ["Single-ATC", "Single-Orders", "Joint", "Average", "Joint+Time"]
-    for approach in approach_order:
+    for approach in APPROACH_ORDER:
         for metric in ["atc", "orders"]:
             try:
                 row = summary.loc[(approach, metric)]
             except KeyError:
                 continue
             fpr_flag = " *" if abs(row["fpr"] - cfg.alpha) > 0.02 else "  "
-            print(f"  {approach:<14} {metric.upper():<8} "
+            print(f"  {approach:<20} {metric.upper():<8} "
                   f"{row['bias']:>8.4f} {row['mse']:>8.4f} "
                   f"{row['emp_se']:>8.4f} {row['fpr']:>6.3f}{fpr_flag} "
                   f"{row['mean_rmspe']:>8.4f}")
@@ -578,16 +622,7 @@ def plot_results(results: pd.DataFrame, cfg: SimConfig):
     results = results.copy()
     results["approach_label"] = results["approach"].map(APPROACH_LABELS)
 
-    approach_order = ["Single-ATC", "Single-Orders", "Joint", "Average", "Joint+Time"]
-    colors = {
-        "Single-ATC":    "#E57373",
-        "Single-Orders": "#FF8A65",
-        "Joint":         "#4CAF50",
-        "Average":       "#64B5F6",
-        "Joint+Time":    "#9575CD",
-    }
-
-    fig = plt.figure(figsize=(16, 14))
+    fig = plt.figure(figsize=(20, 14))
     fig.suptitle(
         f"A/A Simulation: Multi-Metric Synthetic DiD Weight Comparison\n"
         f"{cfg.n_simulations} sims | {cfg.n_units} units | "
@@ -601,17 +636,17 @@ def plot_results(results: pd.DataFrame, cfg: SimConfig):
     for col, metric in enumerate(["atc", "orders"]):
         ax = fig.add_subplot(gs[0, col])
         sub = results[results["metric"] == metric]
-        for approach in approach_order:
+        for approach in APPROACH_ORDER:
             vals = sub[sub["approach_label"] == approach]["tau_hat"]
-            ax.hist(vals, bins=30, alpha=0.45, label=approach,
-                    color=colors[approach], edgecolor="none")
+            ax.hist(vals, bins=30, alpha=0.35, label=approach,
+                    color=APPROACH_COLORS[approach], edgecolor="none")
         ax.axvline(0, color="black", linewidth=1.5, linestyle="--", label="True τ=0")
         ax.set_title(f"{metric.upper()} — τ-hat distribution")
         ax.set_xlabel("τ-hat")
         ax.set_ylabel("Frequency")
-        ax.legend(fontsize=7, loc="upper right")
+        ax.legend(fontsize=6, loc="upper right", ncol=2)
 
-    # --- Row 2: FPR bar chart and RMSPE bar chart ---
+    # --- Row 2: FPR bar chart ---
     summary = (
         results
         .groupby(["approach_label", "metric"])
@@ -621,34 +656,31 @@ def plot_results(results: pd.DataFrame, cfg: SimConfig):
 
     for col, metric in enumerate(["atc", "orders"]):
         ax = fig.add_subplot(gs[1, col])
-        sub = summary[summary["metric"] == metric].set_index("approach_label").loc[approach_order]
-        bar_colors = [colors[a] for a in approach_order]
-        bars = ax.bar(approach_order, sub["fpr"], color=bar_colors, edgecolor="white", width=0.6)
+        sub = summary[summary["metric"] == metric].set_index("approach_label").loc[APPROACH_ORDER]
+        bar_colors = [APPROACH_COLORS[a] for a in APPROACH_ORDER]
+        bars = ax.bar(APPROACH_ORDER, sub["fpr"], color=bar_colors, edgecolor="white", width=0.6)
         ax.axhline(cfg.alpha, color="black", linewidth=1.5, linestyle="--", label=f"α={cfg.alpha}")
         ax.set_title(f"{metric.upper()} — False Positive Rate")
         ax.set_ylabel("FPR")
         ax.set_ylim(0, max(sub["fpr"].max() * 1.3, cfg.alpha * 2))
-        ax.set_xticklabels(approach_order, rotation=20, ha="right", fontsize=8)
+        ax.set_xticklabels(APPROACH_ORDER, rotation=30, ha="right", fontsize=7)
         ax.legend(fontsize=8)
         for bar, val in zip(bars, sub["fpr"]):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.002,
-                    f"{val:.3f}", ha="center", va="bottom", fontsize=7)
+                    f"{val:.3f}", ha="center", va="bottom", fontsize=6)
 
-    # --- Row 3: RMSPE bar chart and MSE bar chart ---
-    for col, (metric, ykey, ylabel, title_suffix) in enumerate([
-        ("atc",    "mean_rmspe", "Mean RMSPE", "Pre-treatment RMSPE (demeaned)"),
-        ("orders", "mean_rmspe", "Mean RMSPE", "Pre-treatment RMSPE (demeaned)"),
-    ]):
+    # --- Row 3: RMSPE bar chart ---
+    for col, metric in enumerate(["atc", "orders"]):
         ax = fig.add_subplot(gs[2, col])
-        sub = summary[summary["metric"] == metric].set_index("approach_label").loc[approach_order]
-        bar_colors = [colors[a] for a in approach_order]
-        bars = ax.bar(approach_order, sub[ykey], color=bar_colors, edgecolor="white", width=0.6)
-        ax.set_title(f"{metric.upper()} — {title_suffix}")
-        ax.set_ylabel(ylabel)
-        ax.set_xticklabels(approach_order, rotation=20, ha="right", fontsize=8)
-        for bar, val in zip(bars, sub[ykey]):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + sub[ykey].max() * 0.01,
-                    f"{val:.3f}", ha="center", va="bottom", fontsize=7)
+        sub = summary[summary["metric"] == metric].set_index("approach_label").loc[APPROACH_ORDER]
+        bar_colors = [APPROACH_COLORS[a] for a in APPROACH_ORDER]
+        bars = ax.bar(APPROACH_ORDER, sub["mean_rmspe"], color=bar_colors, edgecolor="white", width=0.6)
+        ax.set_title(f"{metric.upper()} — Pre-treatment RMSPE (demeaned)")
+        ax.set_ylabel("Mean RMSPE")
+        ax.set_xticklabels(APPROACH_ORDER, rotation=30, ha="right", fontsize=7)
+        for bar, val in zip(bars, sub["mean_rmspe"]):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + sub["mean_rmspe"].max() * 0.01,
+                    f"{val:.3f}", ha="center", va="bottom", fontsize=6)
 
     plt.savefig("/Users/aasfaw/claude/sdid_multimetric_results.png", dpi=150, bbox_inches="tight")
     plt.close()
@@ -669,11 +701,11 @@ def plot_results(results: pd.DataFrame, cfg: SimConfig):
         .reset_index()
     )
     stat_summary["approach_label"] = pd.Categorical(
-        stat_summary["approach_label"], categories=approach_order, ordered=True
+        stat_summary["approach_label"], categories=APPROACH_ORDER, ordered=True
     )
     stat_summary = stat_summary.sort_values(["metric", "approach_label"])
 
-    fig2, axes2 = plt.subplots(1, 2, figsize=(16, 5))
+    fig2, axes2 = plt.subplots(1, 2, figsize=(18, 7))
     fig2.suptitle(
         f"A/A Simulation — Summary Statistics\n"
         f"{cfg.n_simulations} sims | {cfg.n_units} units | "
@@ -694,7 +726,6 @@ def plot_results(results: pd.DataFrame, cfg: SimConfig):
         cell_text  = sub[stat_cols].values.tolist()
         row_labels = sub["approach_label"].tolist()
 
-        # Color FPR cells: green if within 0.02 of alpha, red if outside
         cell_colors = []
         for row in sub.itertuples():
             fpr_ok = abs(row.fpr - cfg.alpha) <= 0.02
@@ -709,13 +740,13 @@ def plot_results(results: pd.DataFrame, cfg: SimConfig):
             rowLabels=row_labels,
             colLabels=col_labels,
             cellColours=cell_colors,
-            rowColours=[colors[r] + "55" for r in row_labels],
+            rowColours=[APPROACH_COLORS[r] + "55" for r in row_labels],
             loc="center",
             cellLoc="center",
         )
         tbl.auto_set_font_size(False)
-        tbl.set_fontsize(10)
-        tbl.scale(1.3, 2.0)
+        tbl.set_fontsize(9)
+        tbl.scale(1.3, 2.2)
         ax.set_title(f"{metric.upper()}", fontsize=11, fontweight="bold", pad=12)
 
     fig2.text(0.5, 0.01,
@@ -734,63 +765,62 @@ def plot_results(results: pd.DataFrame, cfg: SimConfig):
 
 def plot_event_study(results: pd.DataFrame, cfg: SimConfig):
     """
-    One event study panel per metric per weighting approach (10 panels total).
+    One event study panel per metric per weighting approach (9 panels per metric).
     Each panel shows:
       - Mean gap across simulations per period (solid line)
       - 95% pointwise CI band (shaded)
       - Vertical dashed line at treatment onset
       - Horizontal dashed line at zero
-      - Baseline period (t = -1, last pre-period) is normalized to 0 by construction
+      - Baseline = mean gap over all pre-treatment periods (normalized to 0)
     """
     import matplotlib.pyplot as plt
 
-    approach_order = ["single_atc", "single_orders", "joint", "average", "joint_time"]
-    colors = {
-        "single_atc":    "#E57373",
-        "single_orders": "#FF8A65",
-        "joint":         "#4CAF50",
-        "average":       "#64B5F6",
-        "joint_time":    "#9575CD",
-    }
+    approach_keys = [
+        "single_atc", "single_orders", "joint", "average", "joint_time",
+        "single_atc_reg", "single_orders_reg", "joint_reg", "joint_reg_time",
+    ]
 
-    T      = cfg.n_pre + cfg.n_post
-    rel_ts = [t - cfg.n_pre for t in range(T)]           # e.g. -8…+3
+    T        = cfg.n_pre + cfg.n_post
+    rel_ts   = [t - cfg.n_pre for t in range(T)]
     gap_cols = [f"gap_t{t}" for t in rel_ts]
 
     for metric in ["atc", "orders"]:
-        fig, axes = plt.subplots(1, 5, figsize=(22, 4), sharey=True)
+        fig, axes = plt.subplots(2, 5, figsize=(26, 9), sharey=True)
+        axes = axes.flatten()
         fig.suptitle(
-            f"Event Study — {metric.upper()} | Baseline = t=−1 (last pre-period) | "
+            f"Event Study — {metric.upper()} | Baseline = mean pre-treatment gap | "
             f"True τ = 0 | {cfg.n_simulations} sims",
-            fontsize=11, fontweight="bold"
+            fontsize=12, fontweight="bold"
         )
 
         sub = results[results["metric"] == metric]
 
-        for col, approach in enumerate(approach_order):
+        for col, approach in enumerate(approach_keys):
             ax = axes[col]
             ap_sub = sub[sub["approach"] == approach][gap_cols]
 
-            mean_gap = ap_sub.mean(axis=0).values         # (T,)
-            se_gap   = ap_sub.std(axis=0).values          # (T,)
+            mean_gap = ap_sub.mean(axis=0).values
+            se_gap   = ap_sub.std(axis=0).values
             ci_lo    = mean_gap - 1.96 * se_gap
             ci_hi    = mean_gap + 1.96 * se_gap
 
-            color = colors[approach]
+            color = APPROACH_COLORS[APPROACH_LABELS[approach]]
 
             ax.fill_between(rel_ts, ci_lo, ci_hi, alpha=0.20, color=color)
             ax.plot(rel_ts, mean_gap, color=color, linewidth=2, marker="o", markersize=4)
-
-            ax.axvline(-0.5, color="black", linewidth=1.2, linestyle="--", label="Treatment")
+            ax.axvline(-0.5, color="black", linewidth=1.2, linestyle="--")
             ax.axhline(0,    color="gray",  linewidth=0.8, linestyle=":")
 
             ax.set_title(APPROACH_LABELS[approach], fontsize=9, fontweight="bold")
-            ax.set_xlabel("Period relative to treatment")
-            if col == 0:
-                ax.set_ylabel("Gap (treated − synthetic control)\nnormalized to 0 at t=−1")
+            ax.set_xlabel("Period relative to treatment", fontsize=8)
+            if col % 5 == 0:
+                ax.set_ylabel("Gap\n(normalized to pre-mean=0)", fontsize=8)
             ax.set_xticks(rel_ts)
             ax.set_xticklabels([str(t) for t in rel_ts], fontsize=7, rotation=45)
             ax.grid(True, alpha=0.25)
+
+        # Hide the unused 10th panel
+        axes[9].set_visible(False)
 
         plt.tight_layout()
         fname = f"/Users/aasfaw/claude/sdid_event_study_{metric}.png"
