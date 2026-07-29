@@ -1,7 +1,7 @@
 """
-Synthetic DiD — Multi-Metric Weight Comparison (A/A Simulation)
-Compares 5 weighting approaches on bias, MSE, SE, and false positive rate
-under the null (tau=0, no treatment effect).
+Synthetic DiD — Multi-Metric Weight Comparison
+Compares 9 weighting approaches on bias, MSE, SE, FPR/power, and RMSPE.
+Supports both A/A (tau=0) and A/B (tau>0) scenarios via SimConfig.
 
 Based on: Tian, Lee & Panchenko (2026), "Synthetic Controls with Multiple Outcomes",
           The Econometrics Journal. doi:10.1093/ectj/utag005
@@ -36,11 +36,18 @@ class SimConfig:
     eps_sd_atc: float = 3.0     # idiosyncratic noise SD for ATC
     eps_sd_orders: float = 2.0  # idiosyncratic noise SD for Orders
 
+    # Treatment effect — multiplicative lift applied to baseline means
+    # tau=0.0 → A/A (null); tau=0.02 → 2% lift on treated units in post periods
+    tau: float = 0.0
+
     # Monte Carlo
     n_simulations: int = 500
     n_permutations: int = 100   # permutations per sim for inference
     alpha: float = 0.05
     seed: int = 42
+
+    # Output directory (will be created if it does not exist)
+    output_dir: str = "/Users/aasfaw/claude/results/aa"
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +96,14 @@ def generate_panel(cfg: SimConfig, rng: np.random.Generator):
     # Idiosyncratic noise: (T, N)
     eps_atc    = rng.normal(0, cfg.eps_sd_atc,    size=(n_periods, cfg.n_units))
     eps_orders = rng.normal(0, cfg.eps_sd_orders, size=(n_periods, cfg.n_units))
+
+    # Treatment effect: additive lift on treated units in post periods
+    # lift_k = tau * baseline_k  (absolute units matching each metric's scale)
+    if cfg.tau != 0.0:
+        post_mask   = np.zeros((n_periods, cfg.n_units))
+        post_mask[cfg.n_pre:, :n_treat] = 1.0
+        sys_atc    = sys_atc    + cfg.tau * cfg.atc_mean    * post_mask
+        sys_orders = sys_orders + cfg.tau * cfg.orders_mean * post_mask
 
     # Y shape: (K=2, T, N)
     Y = np.stack([
@@ -584,15 +599,23 @@ def summarize_results(results: pd.DataFrame) -> pd.DataFrame:
 
 
 def print_summary(summary: pd.DataFrame, cfg: SimConfig):
+    is_ab   = cfg.tau != 0.0
+    scenario = f"A/B (τ={cfg.tau*100:.1f}% lift)" if is_ab else "A/A (τ=0)"
+    sig_label = "Power" if is_ab else "FPR"
+    true_atc    = cfg.tau * cfg.atc_mean
+    true_orders = cfg.tau * cfg.orders_mean
+
     print()
-    print("=" * 72)
-    print("  A/A SIMULATION RESULTS")
-    print(f"  {cfg.n_simulations} simulations | {cfg.n_units} units | "
+    print("=" * 78)
+    print(f"  SIMULATION RESULTS — {scenario}")
+    print(f"  {cfg.n_simulations} sims | {cfg.n_units} units | "
           f"{cfg.n_pre} pre + {cfg.n_post} post periods | α={cfg.alpha}")
-    print("=" * 72)
-    print(f"\n{'Approach':<16} {'Metric':<8} {'Bias':>8} {'MSE':>8} "
-          f"{'Emp SE':>8} {'FPR':>7} {'RMSPE':>8}")
-    print("-" * 72)
+    if is_ab:
+        print(f"  True effect: ATC={true_atc:.2f}  Orders={true_orders:.2f}")
+    print("=" * 78)
+    print(f"\n{'Approach':<22} {'Metric':<8} {'Bias':>8} {'MSE':>8} "
+          f"{'Emp SE':>8} {sig_label:>7} {'RMSPE':>8}")
+    print("-" * 78)
 
     for approach in APPROACH_ORDER:
         for metric in ["atc", "orders"]:
@@ -600,14 +623,19 @@ def print_summary(summary: pd.DataFrame, cfg: SimConfig):
                 row = summary.loc[(approach, metric)]
             except KeyError:
                 continue
-            fpr_flag = " *" if abs(row["fpr"] - cfg.alpha) > 0.02 else "  "
+            sig_val  = row["fpr"]
+            if is_ab:
+                flag = "  "   # no flagging for power — higher is better
+            else:
+                flag = " *" if abs(sig_val - cfg.alpha) > 0.02 else "  "
             print(f"  {approach:<20} {metric.upper():<8} "
                   f"{row['bias']:>8.4f} {row['mse']:>8.4f} "
-                  f"{row['emp_se']:>8.4f} {row['fpr']:>6.3f}{fpr_flag} "
+                  f"{row['emp_se']:>8.4f} {sig_val:>6.3f}{flag} "
                   f"{row['mean_rmspe']:>8.4f}")
 
-    print("-" * 72)
-    print("  * FPR deviates from nominal α by more than 0.02")
+    print("-" * 78)
+    if not is_ab:
+        print("  * FPR deviates from nominal α by more than 0.02")
     print()
 
 
@@ -615,16 +643,24 @@ def print_summary(summary: pd.DataFrame, cfg: SimConfig):
 # Plotting
 # ---------------------------------------------------------------------------
 
-def plot_results(results: pd.DataFrame, cfg: SimConfig):
+def plot_results(results: pd.DataFrame, cfg: SimConfig, out: str = None):
     import matplotlib.pyplot as plt
     import matplotlib.gridspec as gridspec
+
+    import os
+    out = out or cfg.output_dir
+    os.makedirs(out, exist_ok=True)
+
+    is_ab    = cfg.tau != 0.0
+    scenario = f"A/B (τ={cfg.tau*100:.1f}% lift)" if is_ab else "A/A (τ=0)"
+    sig_label = "Power" if is_ab else "FPR"
 
     results = results.copy()
     results["approach_label"] = results["approach"].map(APPROACH_LABELS)
 
     fig = plt.figure(figsize=(20, 14))
     fig.suptitle(
-        f"A/A Simulation: Multi-Metric Synthetic DiD Weight Comparison\n"
+        f"Multi-Metric Synthetic DiD — {scenario}\n"
         f"{cfg.n_simulations} sims | {cfg.n_units} units | "
         f"{cfg.n_pre} pre + {cfg.n_post} post periods",
         fontsize=13, fontweight="bold", y=0.98
@@ -660,8 +696,8 @@ def plot_results(results: pd.DataFrame, cfg: SimConfig):
         bar_colors = [APPROACH_COLORS[a] for a in APPROACH_ORDER]
         bars = ax.bar(APPROACH_ORDER, sub["fpr"], color=bar_colors, edgecolor="white", width=0.6)
         ax.axhline(cfg.alpha, color="black", linewidth=1.5, linestyle="--", label=f"α={cfg.alpha}")
-        ax.set_title(f"{metric.upper()} — False Positive Rate")
-        ax.set_ylabel("FPR")
+        ax.set_title(f"{metric.upper()} — {sig_label}")
+        ax.set_ylabel(sig_label)
         ax.set_ylim(0, max(sub["fpr"].max() * 1.3, cfg.alpha * 2))
         ax.set_xticklabels(APPROACH_ORDER, rotation=30, ha="right", fontsize=7)
         ax.legend(fontsize=8)
@@ -682,11 +718,12 @@ def plot_results(results: pd.DataFrame, cfg: SimConfig):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + sub["mean_rmspe"].max() * 0.01,
                     f"{val:.3f}", ha="center", va="bottom", fontsize=6)
 
-    plt.savefig("/Users/aasfaw/claude/sdid_multimetric_results.png", dpi=150, bbox_inches="tight")
+    fpath = os.path.join(out, "sdid_multimetric_results.png")
+    plt.savefig(fpath, dpi=150, bbox_inches="tight")
     plt.close()
-    print("Plot saved to sdid_multimetric_results.png")
+    print(f"Plot saved to {fpath}")
 
-    # --- Separate table figure: bias, MSE, SE, FPR, RMSPE ---
+    # --- Separate table figure: bias, MSE, SE, FPR/Power, RMSPE ---
     stat_summary = (
         results
         .groupby(["approach_label", "metric"])
@@ -705,16 +742,17 @@ def plot_results(results: pd.DataFrame, cfg: SimConfig):
     )
     stat_summary = stat_summary.sort_values(["metric", "approach_label"])
 
+    true_tau_str = f"τ_ATC={cfg.tau*cfg.atc_mean:.2f}, τ_Orders={cfg.tau*cfg.orders_mean:.2f}" if is_ab else "True τ = 0"
     fig2, axes2 = plt.subplots(1, 2, figsize=(18, 7))
     fig2.suptitle(
-        f"A/A Simulation — Summary Statistics\n"
+        f"Summary Statistics — {scenario}\n"
         f"{cfg.n_simulations} sims | {cfg.n_units} units | "
-        f"{cfg.n_pre} pre + {cfg.n_post} post periods | True τ = 0",
+        f"{cfg.n_pre} pre + {cfg.n_post} post periods | {true_tau_str}",
         fontsize=12, fontweight="bold"
     )
 
     stat_cols  = ["bias", "mse", "emp_se", "fpr", "mean_rmspe"]
-    col_labels = ["Bias", "MSE", "Emp SE", "FPR", "RMSPE"]
+    col_labels = ["Bias", "MSE", "Emp SE", sig_label, "RMSPE"]
 
     for col, metric in enumerate(["atc", "orders"]):
         ax = axes2[col]
@@ -754,16 +792,17 @@ def plot_results(results: pd.DataFrame, cfg: SimConfig):
               ha="center", fontsize=9, style="italic")
 
     plt.tight_layout(rect=[0, 0.04, 1, 1])
-    plt.savefig("/Users/aasfaw/claude/sdid_multimetric_table.png", dpi=150, bbox_inches="tight")
+    fpath2 = os.path.join(out, "sdid_multimetric_table.png")
+    plt.savefig(fpath2, dpi=150, bbox_inches="tight")
     plt.close()
-    print("Table plot saved to sdid_multimetric_table.png")
+    print(f"Table plot saved to {fpath2}")
 
 
 # ---------------------------------------------------------------------------
 # Event study plots
 # ---------------------------------------------------------------------------
 
-def plot_event_study(results: pd.DataFrame, cfg: SimConfig):
+def plot_event_study(results: pd.DataFrame, cfg: SimConfig, out: str = None):
     """
     One event study panel per metric per weighting approach (9 panels per metric).
     Each panel shows:
@@ -773,7 +812,12 @@ def plot_event_study(results: pd.DataFrame, cfg: SimConfig):
       - Horizontal dashed line at zero
       - Baseline = mean gap over all pre-treatment periods (normalized to 0)
     """
-    import matplotlib.pyplot as plt
+    import matplotlib.pyplot as plt, os
+    out = out or cfg.output_dir
+    os.makedirs(out, exist_ok=True)
+
+    is_ab    = cfg.tau != 0.0
+    scenario = f"A/B (τ={cfg.tau*100:.1f}% lift)" if is_ab else "A/A (τ=0)"
 
     approach_keys = [
         "single_atc", "single_orders", "joint", "average", "joint_time",
@@ -784,12 +828,19 @@ def plot_event_study(results: pd.DataFrame, cfg: SimConfig):
     rel_ts   = [t - cfg.n_pre for t in range(T)]
     gap_cols = [f"gap_t{t}" for t in rel_ts]
 
+    # True effect per metric (absolute, additive) for reference line
+    true_effects = {
+        "atc":    cfg.tau * cfg.atc_mean,
+        "orders": cfg.tau * cfg.orders_mean,
+    }
+
     for metric in ["atc", "orders"]:
         fig, axes = plt.subplots(2, 5, figsize=(26, 9), sharey=True)
         axes = axes.flatten()
+        true_eff = true_effects[metric]
         fig.suptitle(
-            f"Event Study — {metric.upper()} | Baseline = mean pre-treatment gap | "
-            f"True τ = 0 | {cfg.n_simulations} sims",
+            f"Event Study — {metric.upper()} | {scenario} | "
+            f"Baseline = mean pre-treatment gap | {cfg.n_simulations} sims",
             fontsize=12, fontweight="bold"
         )
 
@@ -808,8 +859,14 @@ def plot_event_study(results: pd.DataFrame, cfg: SimConfig):
 
             ax.fill_between(rel_ts, ci_lo, ci_hi, alpha=0.20, color=color)
             ax.plot(rel_ts, mean_gap, color=color, linewidth=2, marker="o", markersize=4)
-            ax.axvline(-0.5, color="black", linewidth=1.2, linestyle="--")
+            ax.axvline(-0.5, color="black", linewidth=1.2, linestyle="--", label="Treatment")
             ax.axhline(0,    color="gray",  linewidth=0.8, linestyle=":")
+            # True effect reference: 0 in pre-periods, true_eff in post-periods
+            if is_ab:
+                true_line = [0.0 if t < 0 else true_eff for t in rel_ts]
+                ax.plot(rel_ts, true_line, color="black", linewidth=1.2,
+                        linestyle="-.", label=f"True={true_eff:.2f}")
+                ax.legend(fontsize=6)
 
             ax.set_title(APPROACH_LABELS[approach], fontsize=9, fontweight="bold")
             ax.set_xlabel("Period relative to treatment", fontsize=8)
@@ -823,21 +880,26 @@ def plot_event_study(results: pd.DataFrame, cfg: SimConfig):
         axes[9].set_visible(False)
 
         plt.tight_layout()
-        fname = f"/Users/aasfaw/claude/sdid_event_study_{metric}.png"
+        fname = os.path.join(out, f"sdid_event_study_{metric}.png")
         plt.savefig(fname, dpi=150, bbox_inches="tight")
         plt.close()
-        print(f"Event study saved to sdid_event_study_{metric}.png")
+        print(f"Event study saved to {fname}")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    cfg = SimConfig()
-    print("=" * 72)
-    print("  Multi-Metric Synthetic DiD — A/A Monte Carlo")
-    print("=" * 72)
+def run_scenario(cfg: SimConfig):
+    import os
+    os.makedirs(cfg.output_dir, exist_ok=True)
+
+    is_ab    = cfg.tau != 0.0
+    scenario = f"A/B (τ={cfg.tau*100:.1f}% lift)" if is_ab else "A/A (τ=0)"
+
+    print("=" * 78)
+    print(f"  Multi-Metric Synthetic DiD — {scenario}")
+    print("=" * 78)
     print(f"  Units:          {cfg.n_units}  ({int(cfg.n_units*cfg.treat_share)} treated, "
           f"{cfg.n_units - int(cfg.n_units*cfg.treat_share)} donors)")
     print(f"  Pre periods:    {cfg.n_pre}")
@@ -845,18 +907,31 @@ def main():
     print(f"  Simulations:    {cfg.n_simulations}")
     print(f"  Permutations:   {cfg.n_permutations} per sim")
     print(f"  Alpha:          {cfg.alpha}")
+    print(f"  Output dir:     {cfg.output_dir}")
+    if is_ab:
+        print(f"  True ATC lift:  {cfg.tau*cfg.atc_mean:.2f}  "
+              f"True Orders lift: {cfg.tau*cfg.orders_mean:.2f}")
     print()
 
-    results  = run_monte_carlo(cfg)
-    summary  = summarize_results(results)
+    results = run_monte_carlo(cfg)
+    summary = summarize_results(results)
     print_summary(summary, cfg)
 
-    csv_path = "/Users/aasfaw/claude/sdid_multimetric_summary.csv"
+    csv_path = os.path.join(cfg.output_dir, "sdid_multimetric_summary.csv")
     summary.reset_index().to_csv(csv_path, index=False)
-    print(f"Summary saved to sdid_multimetric_summary.csv")
+    print(f"Summary saved to {csv_path}")
 
-    plot_results(results, cfg)
-    plot_event_study(results, cfg)
+    plot_results(results, cfg, out=cfg.output_dir)
+    plot_event_study(results, cfg, out=cfg.output_dir)
+
+
+def main():
+    # A/B scenario: 2% lift on treated units in post-treatment periods
+    cfg_ab = SimConfig(
+        tau=0.02,
+        output_dir="/Users/aasfaw/claude/results/ab_2pct",
+    )
+    run_scenario(cfg_ab)
 
 
 # ---------------------------------------------------------------------------

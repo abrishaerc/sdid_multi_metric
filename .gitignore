@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Claude Code internal files
+.claude/
+
+# Abandoned prototype
+did_simulation.py
+
+# Loose root-level outputs (clean copies live in results/)
+did_parallel_trends.png
+did_results.png
+sdid_event_study_atc.png
+sdid_event_study_orders.png
+sdid_multimetric_results.png
+sdid_multimetric_summary.csv
+sdid_multimetric_table.png
