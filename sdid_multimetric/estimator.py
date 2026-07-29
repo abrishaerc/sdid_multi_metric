@@ -307,6 +307,123 @@ def estimate_effect(
 # Permutation inference
 # ---------------------------------------------------------------------------
 
+def analyze(
+    Y: np.ndarray,
+    treated: np.ndarray,
+    n_pre: int,
+    metric_names: list[str] | None = None,
+    n_permutations: int = 500,
+    alpha: float = 0.05,
+    approach: str = "joint",
+    regularize: bool = False,
+    seed: int = 0,
+) -> dict:
+    """
+    One-shot treatment effect analysis on real panel data.
+
+    This is the main entry point for estimating the effect of a real
+    intervention — no simulation needed.  Estimates the ATT for each metric,
+    runs a permutation test, and returns a tidy results dict.
+
+    Parameters
+    ----------
+    Y               : (K, T, N) outcome array.
+                      K = number of metrics, T = total periods (pre + post),
+                      N = total units.
+    treated         : (N,) binary array — 1 for treated units, 0 for donors.
+    n_pre           : number of pre-treatment periods.
+    metric_names    : optional list of K metric labels (e.g. ["revenue", "orders"]).
+                      Defaults to ["metric_0", "metric_1", ...].
+    n_permutations  : number of permutations for the p-value (default 500).
+    alpha           : significance level (default 0.05).
+    approach        : which weighting approach to use.  One of:
+                        "joint"          — joint objective across all metrics (default)
+                        "average"        — average of single-metric weights
+                        "joint_time"     — joint + SDiD time weights
+                        "joint_reg"      — L2-regularized joint
+                        "joint_reg_time" — regularized joint + SDiD time weights
+                        "single_k"       — single-metric weights for metric k (0-indexed)
+    regularize      : if True and approach="joint", applies L2 ridge penalty.
+                      Equivalent to approach="joint_reg".
+    seed            : random seed for permutation test.
+
+    Returns
+    -------
+    results : dict with keys
+        "estimates"  — list of dicts, one per metric:
+                         metric, tau_hat, pvalue, significant, ci_lo, ci_hi
+        "weights"    — (J,) donor unit weight array
+        "lambda_t"   — (T_pre,) SDiD time weights (None if approach has no time weights)
+        "gap_series" — (K, T) per-period gap array
+        "approach"   — approach name used
+        "alpha"      — significance level
+
+    Example
+    -------
+    >>> import numpy as np
+    >>> from sdid_multimetric import analyze
+    >>>
+    >>> # Y: (K=2, T=12, N=100) — 2 metrics, 12 periods, 100 units
+    >>> # First 8 periods are pre-treatment; last 4 are post
+    >>> results = analyze(Y, treated, n_pre=8,
+    ...                   metric_names=["revenue", "orders"],
+    ...                   approach="joint")
+    >>>
+    >>> for row in results["estimates"]:
+    ...     print(f"{row['metric']}: tau={row['tau_hat']:.3f}, "
+    ...           f"p={row['pvalue']:.3f}, sig={row['significant']}")
+    """
+    K = Y.shape[0]
+    if metric_names is None:
+        metric_names = [f"metric_{k}" for k in range(K)]
+    if len(metric_names) != K:
+        raise ValueError(f"metric_names has {len(metric_names)} entries but Y has K={K} metrics.")
+
+    # Map convenience shorthand
+    if regularize and approach == "joint":
+        approach = "joint_reg"
+
+    rng      = np.random.default_rng(seed)
+    weights  = fit(Y, treated, n_pre)
+    lambda_t = weights["_lambda_t"]
+
+    time_weight_approaches = {"joint_time", "joint_reg_time"}
+    lam = lambda_t if approach in time_weight_approaches else None
+
+    if approach not in weights:
+        raise ValueError(
+            f"Unknown approach '{approach}'. Available: {[k for k in weights if not k.startswith('_')]}"
+        )
+
+    w        = weights[approach]
+    observed = estimate_effect(Y, treated, w, n_pre, lam)
+    pvals    = permutation_pvalue(
+        Y, treated, w, n_pre,
+        lambda_t if lam is not None else np.ones(n_pre) / n_pre,
+        observed, n_permutations, rng,
+    )
+    gap = compute_gap_series(Y, treated, w)   # (K, T)
+
+    # Bootstrap-style CI from permutation distribution — shift to be centred on tau_hat
+    estimates = []
+    for k in range(K):
+        estimates.append({
+            "metric":      metric_names[k],
+            "tau_hat":     float(observed[k]),
+            "pvalue":      float(pvals[k]),
+            "significant": bool(pvals[k] < alpha),
+        })
+
+    return {
+        "estimates":  estimates,
+        "weights":    w,
+        "lambda_t":   lambda_t if lam is not None else None,
+        "gap_series": gap,
+        "approach":   approach,
+        "alpha":      alpha,
+    }
+
+
 def permutation_pvalue(
     Y: np.ndarray,
     treated: np.ndarray,

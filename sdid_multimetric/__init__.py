@@ -22,6 +22,7 @@ Quickstart
 """
 
 from .estimator import (
+    analyze,
     demean,
     solve_unit_weights,
     solve_time_weights,
@@ -32,6 +33,7 @@ from .estimator import (
 )
 
 __all__ = [
+    "analyze",
     "demean",
     "solve_unit_weights",
     "solve_time_weights",

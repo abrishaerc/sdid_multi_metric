@@ -17,36 +17,56 @@ pip install git+https://github.com/abrishaerc/sdid_multi_metric.git
 
 ---
 
-## Quickstart
+## Quickstart — estimating the effect of a real experiment
 
 ```python
 import numpy as np
-from sdid_multimetric import fit, estimate_effect
+from sdid_multimetric import analyze
 
-# Y: (K, T, N) — K metrics, T periods, N units
-# treated: (N,) — 1 for treated, 0 for donors
-# n_pre: number of pre-treatment periods
+# Prepare your data as a (K, T, N) numpy array:
+#   K = number of metrics  (e.g. 2 for revenue + orders)
+#   T = total time periods (pre-treatment + post-treatment)
+#   N = total units        (treated + donor/control units)
+#
+# Y[k, t, i] is the value of metric k for unit i at period t.
+# treated[i] = 1 if unit i was treated, 0 if it is a donor.
 
-rng = np.random.default_rng(42)
-K, T, N, n_pre = 2, 12, 100, 8
-Y = rng.normal(size=(K, T, N))
-treated = np.array([1] * 20 + [0] * 80)
+results = analyze(
+    Y,
+    treated,
+    n_pre=8,                              # periods before the intervention
+    metric_names=["revenue", "orders"],   # optional labels
+    approach="joint",                     # recommended default
+    n_permutations=500,                   # permutations for p-value
+    alpha=0.05,
+)
 
-# Estimate all weight variants
-weights = fit(Y, treated, n_pre=n_pre)
+for row in results["estimates"]:
+    print(f"{row['metric']}: tau={row['tau_hat']:.3f}, "
+          f"p={row['pvalue']:.3f}, significant={row['significant']}")
 
-# Available weight keys: "joint", "average", "joint_time",
-#   "single_0", "single_1", ..., "single_0_reg", "joint_reg", ...
-w_joint  = weights["joint"]       # (J,) donor weights from joint objective
-lambda_t = weights["_lambda_t"]   # (T_pre,) SDiD time weights
+# revenue: tau=12.34, p=0.012, significant=True
+# orders:  tau=3.21,  p=0.041, significant=True
+```
 
-# Estimate treatment effect
-tau_hat = estimate_effect(Y, treated, w_joint, n_pre=n_pre)
-# tau_hat: (K,) — one estimate per metric
+### Available approaches
 
-# With SDiD time weights
-tau_hat_sdid = estimate_effect(Y, treated, weights["joint_time"],
-                               n_pre=n_pre, lambda_t=lambda_t)
+| `approach=` | Description |
+|-------------|-------------|
+| `"joint"` | Joint objective across all K metrics — **recommended default** |
+| `"joint_reg"` | Same, with L2 ridge regularization — better when donor pool is small |
+| `"joint_time"` | Joint unit weights + SDiD time weights |
+| `"joint_reg_time"` | Regularized joint + SDiD time weights |
+| `"average"` | Simple average of single-metric weights |
+| `"single_0"`, `"single_1"`, ... | Single-metric weights for metric k |
+
+### What `analyze()` returns
+
+```python
+results["estimates"]   # list of dicts: metric, tau_hat, pvalue, significant
+results["weights"]     # (J,) donor unit weight array
+results["lambda_t"]    # (T_pre,) SDiD time weights, or None
+results["gap_series"]  # (K, T) per-period gap between treated and synthetic control
 ```
 
 ---
